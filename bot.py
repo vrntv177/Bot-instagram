@@ -5,8 +5,8 @@ import os
 import sqlite3
 import logging
 import asyncio
-from datetime import datetime, timezone
 from pathlib import Path
+from datetime import datetime, timezone
 
 import discord
 from discord.ext import commands
@@ -18,18 +18,40 @@ TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0"))
 DB_PATH = os.getenv("DB_PATH", "jamaica.db")
 
-MAX_FILE_SIZE = 10 * 1024 * 1024
+MAX_FILE_SIZE = 25 * 1024 * 1024
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("jamaica")
 
-SUPPORTED_TYPES = {
-    "image/png",
-    "image/jpeg",
-    "image/webp",
-    "image/gif",
-    "video/mp4",
-    "video/webm",
+EXTENSIONS = {
+    ".png", ".jpg", ".jpeg", ".webp",
+    ".gif", ".mp4", ".mov", ".webm",
+    ".m4v"
+}
+
+IMAGE_EXTENSIONS = {
+    ".png", ".jpg", ".jpeg", ".webp", ".gif"
+}
+
+VIDEO_EXTENSIONS = {
+    ".mp4", ".mov", ".webm", ".m4v"
+}
+
+MIME_TYPES = {
+    "image/png", "image/jpeg", "image/webp",
+    "image/gif", "video/mp4", "video/quicktime",
+    "video/webm", "video/x-m4v"
+}
+
+MIME_TO_EXTENSION = {
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/webp": ".webp",
+    "image/gif": ".gif",
+    "video/mp4": ".mp4",
+    "video/quicktime": ".mov",
+    "video/webm": ".webm",
+    "video/x-m4v": ".m4v"
 }
 
 
@@ -52,8 +74,8 @@ def init_database():
         CREATE TABLE IF NOT EXISTS likes (
             message_id INTEGER NOT NULL,
             user_id INTEGER NOT NULL,
-            PRIMARY KEY(message_id, user_id),
-            FOREIGN KEY(message_id)
+            PRIMARY KEY (message_id, user_id),
+            FOREIGN KEY (message_id)
             REFERENCES posts(message_id)
             ON DELETE CASCADE
         );
@@ -64,56 +86,70 @@ def init_database():
             user_id INTEGER NOT NULL,
             body TEXT NOT NULL,
             created_at TEXT NOT NULL,
-            FOREIGN KEY(message_id)
+            FOREIGN KEY (message_id)
             REFERENCES posts(message_id)
             ON DELETE CASCADE
         );
         """)
 
 
-def get_post(mid):
+def get_post(message_id):
     with connect() as db:
         return db.execute(
             "SELECT author_id FROM posts WHERE message_id=?",
-            (mid,)
+            (message_id,)
         ).fetchone()
 
 
-def get_counts(mid):
+def get_counts(message_id):
     with connect() as db:
         likes = db.execute(
             "SELECT COUNT(*) FROM likes WHERE message_id=?",
-            (mid,)
+            (message_id,)
         ).fetchone()[0]
 
         comments = db.execute(
             "SELECT COUNT(*) FROM comments WHERE message_id=?",
-            (mid,)
+            (message_id,)
         ).fetchone()[0]
 
     return likes, comments
 
 
-def create_embed(author, filename, caption, is_video):
+def media_info(attachment):
+    mime = (attachment.content_type or "").split(";")[0].lower()
+    suffix = Path(attachment.filename).suffix.lower()
+
+    if suffix not in EXTENSIONS:
+        suffix = MIME_TO_EXTENSION.get(mime)
+
+    if suffix not in EXTENSIONS:
+        return None
+
+    is_video = suffix in VIDEO_EXTENSIONS
+
+    return suffix, is_video
+
+
+def make_embed(author, filename, caption, is_video):
     description = f"**Autor(a):** {author.mention}"
 
     if caption.strip():
-        safe_caption = discord.utils.escape_mentions(
-            caption[:900]
+        description += (
+            "\n\n" +
+            discord.utils.escape_mentions(caption[:900])
         )
-        description += f"\n\n{safe_caption}"
 
     embed = discord.Embed(
         description=description,
-        color=discord.Color.from_rgb(25, 110, 55)
+        color=0x15803D,
+        timestamp=datetime.now(timezone.utc)
     )
 
-    if not is_video:
-        embed.set_image(
-            url=f"attachment://{filename}"
-        )
-    else:
+    if is_video:
         embed.description += "\n\n🎬 **Vídeo publicado**"
+    else:
+        embed.set_image(url=f"attachment://{filename}")
 
     return embed
 
@@ -121,11 +157,12 @@ def create_embed(author, filename, caption, is_video):
 class CommentModal(discord.ui.Modal):
     def __init__(self, post_id):
         super().__init__(title="Comentar publicação")
+
         self.post_id = post_id
 
         self.comment = discord.ui.TextInput(
             label="Seu comentário",
-            placeholder="Digite seu comentário...",
+            placeholder="Escreva seu comentário...",
             style=discord.TextStyle.paragraph,
             max_length=500,
             required=True
@@ -135,11 +172,10 @@ class CommentModal(discord.ui.Modal):
 
     async def on_submit(self, interaction):
         if not get_post(self.post_id):
-            await interaction.response.send_message(
-                "Publicação indisponível",
+            return await interaction.response.send_message(
+                "Publicação não encontrada",
                 ephemeral=True
             )
-            return
 
         with connect() as db:
             db.execute(
@@ -170,11 +206,14 @@ class PostView(discord.ui.View):
         super().__init__(timeout=None)
 
         for item in self.children:
-            if isinstance(item, discord.ui.Button):
-                if item.custom_id == "jamaica:like":
-                    item.label = str(likes)
-                elif item.custom_id == "jamaica:comment":
-                    item.label = str(comments)
+            if not isinstance(item, discord.ui.Button):
+                continue
+
+            if item.custom_id == "jamaica:like":
+                item.label = str(likes)
+
+            elif item.custom_id == "jamaica:comment":
+                item.label = str(comments)
 
     @discord.ui.button(
         emoji="❤️",
@@ -188,7 +227,7 @@ class PostView(discord.ui.View):
 
         if not get_post(mid):
             return await interaction.response.send_message(
-                "Publicação não encontrada",
+                "Publicação indisponível",
                 ephemeral=True
             )
 
@@ -251,14 +290,14 @@ class PostView(discord.ui.View):
                 ephemeral=True
             )
 
-        is_mod = (
+        moderator = (
             isinstance(interaction.user, discord.Member)
             and interaction.user.guild_permissions.manage_messages
         )
 
-        if interaction.user.id != post[0] and not is_mod:
+        if interaction.user.id != post[0] and not moderator:
             return await interaction.response.send_message(
-                "Apenas o autor ou a moderação pode excluir",
+                "Você não pode excluir esta publicação",
                 ephemeral=True
             )
 
@@ -268,7 +307,7 @@ class PostView(discord.ui.View):
             await interaction.message.delete()
         except discord.HTTPException:
             return await interaction.followup.send(
-                "Não consegui excluir a publicação",
+                "Não consegui excluir",
                 ephemeral=True
             )
 
@@ -308,7 +347,7 @@ class PostView(discord.ui.View):
 
         names = "\n".join(
             f"• <@{uid}>" for (uid,) in rows
-        ) or "Nenhuma curtida ainda"
+        ) or "Ninguém curtiu ainda"
 
         if total > 30:
             names += f"\nE mais {total - 30} pessoas"
@@ -376,13 +415,9 @@ async def refresh_post(channel, mid):
 
     try:
         msg = await channel.fetch_message(mid)
-        await msg.edit(
-            view=PostView(likes, comments)
-        )
+        await msg.edit(view=PostView(likes, comments))
     except discord.HTTPException:
-        log.exception(
-            "Não foi possível atualizar a publicação"
-        )
+        log.exception("Erro ao atualizar publicação")
 
 
 intents = discord.Intents.default()
@@ -397,58 +432,56 @@ bot = commands.Bot(
 
 @bot.event
 async def on_ready():
-    if not getattr(bot, "_view_ready", False):
+    if not getattr(bot, "_views_registered", False):
         bot.add_view(PostView())
-        bot._view_ready = True
+        bot._views_registered = True
 
     log.info("Bot conectado: %s", bot.user)
 
 
 @bot.event
 async def on_message(message):
-    if (
-        message.author.bot
-        or not message.guild
-        or message.channel.id != CHANNEL_ID
-    ):
+    if message.author.bot or not message.guild:
         return
 
-    attachment = next(
-        (
-            a for a in message.attachments
-            if (a.content_type or "").split(";")[0].lower()
-            in SUPPORTED_TYPES
-        ),
-        None
-    )
+    if message.channel.id != CHANNEL_ID:
+        return
+
+    attachment = None
+    info = None
+
+    for file in message.attachments:
+        result = media_info(file)
+
+        if result:
+            attachment = file
+            info = result
+            break
 
     if not attachment:
+        log.info(
+            "Mensagem %s sem anexo reconhecido. "
+            "Anexos: %s, embeds: %s",
+            message.id,
+            len(message.attachments),
+            len(message.embeds)
+        )
         return
+
+    suffix, is_video = info
 
     if attachment.size > MAX_FILE_SIZE:
         return await message.reply(
-            "Arquivo maior que 10 MB",
+            "Arquivo maior que 25 MB",
             mention_author=False
         )
-
-    is_video = (
-        attachment.content_type or ""
-    ).lower().startswith("video/")
 
     try:
         data = await attachment.read()
 
-        suffix = Path(attachment.filename).suffix.lower()
-
-        if suffix not in {
-            ".png", ".jpg", ".jpeg",
-            ".webp", ".gif", ".mp4", ".webm"
-        }:
-            suffix = ".mp4" if is_video else ".png"
-
         filename = f"jamaica_{message.id}{suffix}"
 
-        embed = create_embed(
+        embed = make_embed(
             message.author,
             filename,
             message.content,
@@ -484,11 +517,18 @@ async def on_message(message):
                 "Sem permissão para apagar mensagem original"
             )
 
+        log.info(
+            "Publicação criada: %s | Autor: %s | Tipo: %s",
+            sent.id,
+            message.author.id,
+            suffix
+        )
+
     except discord.HTTPException:
-        log.exception("Erro ao criar publicação")
+        log.exception("Erro ao publicar mídia")
         await message.reply(
-            "Não consegui publicar. "
-            "Confira as permissões do bot",
+            "Não consegui publicar esta mídia. "
+            "Verifique o tamanho e as permissões",
             mention_author=False
         )
 
@@ -496,7 +536,8 @@ async def on_message(message):
 if __name__ == "__main__":
     if not TOKEN or CHANNEL_ID <= 0:
         raise SystemExit(
-            "Configure DISCORD_TOKEN e CHANNEL_ID no .env"
+            "Configure DISCORD_TOKEN e CHANNEL_ID no .env "
+            "ou nas variáveis da hospedagem"
         )
 
     init_database()
